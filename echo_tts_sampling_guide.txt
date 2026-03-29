@@ -1,0 +1,1162 @@
+================================================================================
+ECHO TTS SAMPLING & INFERENCE GUIDE
+A comprehensive, practical guide to every knob you can turn
+================================================================================
+
+
+================================================================================
+PART 0: WHAT IS ECHO TTS AND HOW DOES IT WORK?
+================================================================================
+
+Echo TTS is a text-to-speech model built on "Rectified Flow", which is a modern
+type of diffusion model. The basic idea is: you give it some text and a short
+recording of someone's voice (the "speaker reference"), and it generates new
+speech that sounds like that person saying your text.
+
+But the model doesn't work directly on audio waveforms -- that would be too
+expensive. Instead, it works in a compressed representation called a "latent
+space." Think of it like this: raw audio at 44.1kHz has 44,100 numbers per
+second. The latent space compresses that down to about 21 vectors per second,
+each with 80 dimensions. That's roughly a 26x compression in time and a massive
+reduction in dimensionality. The diffusion model only needs to generate these
+compact latent vectors, and then a separate decoder expands them back to audio.
+
+The full pipeline looks like this:
+
+  Text + Speaker Audio
+       |
+       v
+  [Text Encoder]  -- converts characters to token embeddings
+  [S1-DAC Encoder + PCA]  -- compresses speaker audio to 80-dim latents
+       |
+       v
+  [DiT Model]  -- Diffusion Transformer, runs 40 denoising steps
+       |         starts from random noise, gradually cleans it up
+       v
+  Clean 80-dim Latent Sequence
+       |
+       v
+  [PCA Inverse + S1-DAC Decoder]  -- expands 80-dim back to 1024-dim, then to audio
+       |
+       v
+  44.1kHz Audio Output
+
+
+IMPORTANT: THE AUDIO CODEC IS S1-DAC, NOT DACVAE
+-------------------------------------------------
+This is a common point of confusion. Echo TTS uses the "Fish-Speech S1 DAC"
+codec (from the repo `jordand/fish-s1-dac-min`), which is a DIFFERENT codec
+from the DACVAE used in the emotion-attribute dataset.
+
+Here's the key difference:
+
+  S1-DAC (used inside Echo TTS):
+    - Based on the Fish-Speech S1 architecture
+    - Operates natively at 44.1kHz
+    - Has Transformer blocks inside the quantizer (8 transformer layers with
+      windowed attention), which makes it unusually good at capturing temporal
+      coherence in the latent space
+    - Uses Residual Vector Quantization (RVQ) with 9 codebooks
+    - The encoder uses strided convolutions with rates (2, 4, 8, 8), giving
+      a raw hop length of 512 samples. The quantizer then further downsamples
+      by 4x (2x twice), giving an effective hop of 2048 samples
+    - At 44.1kHz input, this means ~21.5 latent frames per second
+    - Output latent is 1024-dimensional before PCA, 80-dimensional after PCA
+    - Has a very large decoder (1536-dim) with 4 transformer layers for high
+      quality reconstruction
+
+  DACVAE (used for dataset storage):
+    - Facebook's Descript Audio Codec with VAE-style training
+    - Operates at 48kHz
+    - Simpler architecture without transformer blocks in the quantizer
+    - Used to store/decode audio samples in the emotion-attribute HuggingFace
+      dataset, NOT for Echo TTS inference
+
+When we talk about "encoding" and "decoding" in the context of Echo TTS, we
+always mean S1-DAC. The DACVAE is only relevant when loading audio samples
+from the training dataset.
+
+
+THE LATENT SPACE IN DETAIL
+---------------------------
+Let's trace exactly what happens to audio as it flows through the codec:
+
+  1. Raw audio: 44.1kHz waveform, e.g. 5 seconds = 220,500 samples
+
+  2. S1-DAC Encoder: A series of convolutional layers with downsampling
+     factors (2, 4, 8, 8). The last conv group also has 4 transformer layers
+     for capturing long-range dependencies.
+     After encoding: 220,500 / 512 = 430 frames of 1024-dimensional vectors.
+
+  3. S1-DAC Quantizer: Contains transformer blocks (8 layers, windowed
+     attention with window_size=128) flanked by downsampling/upsampling.
+     The downsample factor is (2, 2) = 4x, so:
+     After quantizer: 430 / 4 = 107 frames of 1024-dimensional vectors.
+     This is the "z_q" (quantized latent).
+
+  4. PCA Projection: A learned linear transformation reduces dimensionality:
+       z_80 = (z_1024 - mean) @ components^T * scale
+     where `components` is an (80, 1024) matrix, `mean` is (1024,), and
+     `scale` is a scalar.
+     After PCA: 107 frames of 80-dimensional vectors.
+
+  5. This is what the diffusion model generates: sequences of 80-dim vectors.
+
+  6. To decode back to audio, we reverse steps 4-1:
+     PCA inverse -> S1-DAC quantizer upsample -> S1-DAC decoder -> waveform.
+
+The effective hop length is 2048 samples at 44.1kHz, which means:
+  - Each latent frame represents 2048/44100 = ~46.4 milliseconds of audio
+  - The latent frame rate is 44100/2048 = ~21.5 frames per second
+  - A 640-frame sequence = ~29.8 seconds of audio
+
+For speaker conditioning, the 80-dim latent frames are further "patched" by
+a factor of 4 (every 4 consecutive frames are concatenated into one token),
+giving ~5.4 speaker tokens per second of reference audio. A typical 10-second
+reference produces about 54 speaker tokens.
+
+
+================================================================================
+PART 1: THE BASIC PARAMETERS
+================================================================================
+
+These are the parameters you'll adjust most often. They're all fields of the
+`SamplerConfig` dataclass (defined in `open_echo_tts/inference/sampler.py`).
+
+
+num_steps (default: 40)
+-----------------------
+This controls how many denoising steps the model takes to transform random
+noise into clean audio latents. The process is an ODE (ordinary differential
+equation) that's solved numerically using Euler's method -- each step takes
+a small step along the predicted velocity direction.
+
+More steps means more opportunities for the model to refine the output, but
+each step costs the same amount of compute, so the relationship between steps
+and wall-clock time is perfectly linear.
+
+  - 40 steps: ~4.4 seconds per generation on A100. This is the default and
+    gives reliably good quality. It's the sweet spot for batch processing
+    where you don't need real-time speeds.
+
+  - 20 steps: ~2.2 seconds. You lose some quality -- the model doesn't have
+    enough steps to fully refine the fine details, so you may hear slight
+    artifacts or less precise pronunciation. But it's 2x faster, which matters
+    a lot when generating thousands of samples.
+
+  - 8 steps: ~1.0 seconds. With a standard model, quality degrades noticeably
+    at this point. The Euler solver simply can't trace the ODE accurately in
+    so few steps. You'd need a "consistency distilled" model (a model
+    specifically trained to produce good results in fewer steps) to make this
+    work well.
+
+  - 100 steps: ~11 seconds. There are severely diminishing returns above 40.
+    The ODE is already well-converged at 40 steps, so adding more steps mostly
+    wastes compute. You might see marginal improvements in very tricky cases
+    (unusual text, extreme emotions), but it's rarely worth the 2.5x slowdown.
+
+The analogy that helps: imagine you're drawing a portrait. With 8 strokes,
+you can get the rough shape right. With 40 strokes, it looks good. With 100
+strokes, you're just touching up individual pixels that nobody will notice.
+
+For our emotion data pipeline, 40 steps is the right choice. We're not
+latency-constrained (this is batch processing), and we want the best possible
+quality so the emotion signal comes through clearly.
+
+
+seed (integer)
+--------------
+The random number generator seed determines the initial noise pattern that
+the diffusion process starts from. Since the denoising process is deterministic
+given the same starting noise, the seed completely determines the output
+(given identical text, speaker reference, and sampler config).
+
+What changes between seeds:
+  - The rhythm and pacing of the speech (where the model places pauses)
+  - Subtle pitch variations and intonation patterns
+  - The exact timing of emphasis within words
+  - Micro-level details like breathiness, vocal fry, etc.
+
+What stays the same between seeds:
+  - The text content (the words spoken)
+  - The overall voice identity (sounds like the same speaker)
+  - The general emotional tone (guided by the speaker reference)
+
+This is exactly like asking an actor to do multiple takes of the same line.
+Each take has slightly different delivery, timing, and energy, even though
+the actor is reading the same words with the same general direction. Some
+takes just "hit different" -- they nail the emotion better, or the pacing
+feels more natural.
+
+In our pipeline, we exploit this by generating multiple seeds (currently 10
+per emotion reference) and scoring each one with Empathic Insight to pick
+the take that best matches the target emotion. This "best-of-N" strategy is
+one of the most powerful tools we have for improving emotion quality, because
+the variance between seeds can be substantial (e.g., Fear scores ranging from
+0.68 to 2.00 across 10 seeds with the same reference).
+
+
+truncation_factor (default: 0.8)
+--------------------------------
+This parameter scales the initial random noise before the denoising process
+begins. It's a simple but powerful control over the diversity-quality tradeoff.
+
+Here's what happens under the hood: normally, the initial noise is sampled
+from a standard normal distribution (mean=0, std=1). The truncation factor
+multiplies this noise, effectively shrinking the standard deviation:
+
+  initial_noise = torch.randn(...) * truncation_factor
+
+The effect on generation:
+
+  - 1.0 (full noise): Maximum diversity between seeds. The model explores the
+    full range of possible outputs. Some will be great, some will be weird.
+    Good if you're generating many seeds and picking the best.
+
+  - 0.8 (default): The noise is 80% of full strength. This slightly biases
+    the model toward the "average" output, reducing the chance of extreme
+    outliers while still allowing meaningful variation between seeds. This is
+    a good default for most use cases.
+
+  - 0.5 (conservative): Very little variation between seeds. The model is
+    strongly biased toward its "most likely" output. Useful if you want
+    consistency, but you lose the ability to find exceptional takes.
+
+  - 0.0: No randomness at all. Every seed produces the same output (or very
+    nearly). This usually sounds lifeless because the model can't explore
+    alternative phrasings. Not recommended.
+
+For our emotion pipeline with 10-seed selection: consider raising this to
+0.85-0.9. More initial noise means more diversity between seeds, which means
+the "best of 10" strategy has a wider pool to choose from. The tradeoff is
+that the worst seeds will be worse, but we're not using the worst ones.
+
+
+sequence_length (default: 640)
+------------------------------
+The maximum number of latent frames the model will generate. Since each frame
+represents ~46.4ms of audio:
+
+  - 640 frames = ~29.8 seconds of audio (the default)
+  - 320 frames = ~14.9 seconds
+  - 128 frames = ~5.9 seconds
+
+The model doesn't always fill the entire sequence. For a short sentence, it
+might only generate 100-200 frames and then the rest would be silence (which
+gets cropped off by the `crop_to_speech` post-processing step). The sequence
+length is really just an upper bound.
+
+For our pipeline, where most generated sentences are 10-20 words (5-15 seconds
+of speech), the default of 640 is fine. We're not generating very long passages,
+so this parameter rarely needs adjustment.
+
+
+================================================================================
+PART 2: CLASSIFIER-FREE GUIDANCE (CFG)
+================================================================================
+
+CFG is the single most important quality control mechanism in Echo TTS. If you
+only tune one thing, tune the CFG scales. Understanding how it works will help
+you make better decisions about the tradeoffs involved.
+
+
+THE CORE IDEA
+-------------
+During training, the model learned to generate speech conditioned on text and
+a speaker reference. But it was also trained to sometimes work WITHOUT these
+conditions (by randomly dropping them out). This means the model knows how
+to generate speech in three scenarios:
+
+  1. With both text AND speaker conditioning (the normal case)
+  2. With speaker conditioning but WITHOUT text (it can babble in a voice)
+  3. With text conditioning but WITHOUT speaker (it can say words in a generic voice)
+
+At inference time, CFG exploits the difference between these scenarios. The
+key insight is: if you compare what the model does WITH a condition versus
+WITHOUT it, the difference tells you exactly what effect that condition has.
+By amplifying this difference, you can make the model follow the condition
+more strongly than it would naturally.
+
+Concretely, each denoising step runs the model THREE times:
+
+  v_cond           = model(noisy_latent, text=text,  speaker=speaker)   # full
+  v_uncond_text    = model(noisy_latent, text=EMPTY, speaker=speaker)   # no text
+  v_uncond_speaker = model(noisy_latent, text=text,  speaker=EMPTY)     # no speaker
+
+Then the final velocity is computed as:
+
+  v_final = v_cond
+            + cfg_scale_text    * (v_cond - v_uncond_text)
+            + cfg_scale_speaker * (v_cond - v_uncond_speaker)
+
+Let's unpack this formula:
+
+  (v_cond - v_uncond_text) is "what the text adds." It captures the model's
+  understanding of pronunciation, word emphasis, timing, and intelligibility.
+  Multiplying by cfg_scale_text amplifies these aspects.
+
+  (v_cond - v_uncond_speaker) is "what the speaker adds." It captures voice
+  identity, prosody, emotional delivery, pitch range, and speaking style.
+  Multiplying by cfg_scale_speaker amplifies these aspects.
+
+The net effect is like turning up the "text clarity" and "speaker similarity"
+dials independently. Higher values push the model to follow each condition
+more aggressively.
+
+IMPORTANT COST NOTE: Because we run 3 forward passes per step (instead of 1),
+CFG makes inference about 3x slower. In practice, the 3 passes are batched
+into a single GPU call with batch_size=3, so it's not literally 3x the wall
+clock time (GPU parallelism helps), but it's still the dominant cost. More
+on how to mitigate this below with cfg_min_t/cfg_max_t.
+
+
+cfg_scale_text (default: 3.0)
+-----------------------------
+Controls how strongly the model follows the text. This primarily affects
+pronunciation clarity, word accuracy, and how "robotic" vs "natural" the
+speech sounds.
+
+  0.0: The model completely ignores the text. It generates speech in the
+       speaker's voice, but the words are gibberish or unrelated to the
+       input text. Obviously useless for TTS, but conceptually interesting:
+       it shows what "just the speaker voice" sounds like without text guidance.
+
+  1.0: Mild text following. The model says roughly the right words, but may
+       mumble, skip syllables, or slur through difficult words. The prosody
+       (rhythm, intonation) feels very natural because the model has freedom
+       to shape the delivery however it wants.
+
+  2.0: Moderate text following. Good intelligibility, with occasional soft
+       spots on uncommon words. The prosody still feels natural and expressive.
+       This is a good value for emotion work because the model can "perform"
+       the text expressively rather than reading it out precisely.
+
+  3.0: The default. Clear pronunciation, reliable word accuracy. A good
+       balance between intelligibility and naturalness for general TTS.
+       Most words are crisp, but the model still has some prosodic freedom.
+
+  5.0: Very strong text following. Every syllable is precisely articulated.
+       But the speech starts to sound somewhat robotic -- the model is
+       spending so much "effort" on getting the words right that it loses
+       some of the natural flow and expressiveness.
+
+  10.0+: Extreme. The speech is hyper-articulated to the point of sounding
+         artificial, like a text-to-speech system from 2015. Not useful
+         in practice.
+
+FOR EMOTION DATA GENERATION: Consider lowering to 2.0-2.5. When we want
+the model to convey fear, sadness, or anger, we need it to have prosodic
+freedom -- to vary the pitch, add trembling, insert dramatic pauses, etc.
+A high text CFG fights against this by forcing precise pronunciation. The
+tradeoff is that you might get occasional word-level errors, but the
+emotional delivery will be more convincing.
+
+
+cfg_scale_speaker (default: 8.0)
+---------------------------------
+Controls how strongly the model matches the speaker reference. In our pipeline,
+the "speaker reference" is the emotion reference audio (after voice conversion
+to the target speaker), so this parameter also directly controls how much
+emotional prosody transfers from the reference.
+
+  0.0: The model ignores the speaker reference entirely. It generates speech
+       in some "average" voice that doesn't sound like anyone in particular.
+       The emotional qualities of the reference are completely lost.
+
+  3.0: Mild speaker matching. The output has some timbral similarity to the
+       reference, but you wouldn't necessarily recognize it as the same speaker.
+       Some emotional qualities may transfer, but weakly.
+
+  5.0: Moderate speaker matching. This is the default for blockwise/streaming
+       mode. Good voice similarity, moderate prosody transfer. The model has
+       enough freedom to adapt the delivery to the text while maintaining the
+       general character of the reference voice.
+
+  8.0: The default for standard mode. Strong speaker preservation. The output
+       voice is clearly recognizable as the same speaker. Prosody patterns
+       (pitch contour, rhythm, emphasis) from the reference transfer noticeably.
+       This is where the balance between quality and similarity tends to be best.
+
+  10.0: Very strong. The model tries hard to replicate not just the voice
+        identity but also the speaking style, energy level, and pitch patterns
+        of the reference. Good for emotion transfer because it pushes the
+        model to match the emotional prosody. The risk is that if the reference
+        has any noise or artifacts, they get amplified too.
+
+  15.0+: Extreme. Can cause audio artifacts: metallic quality, unnatural
+         pitch jumps, or strange resonances. The model is over-fitting to
+         the reference so hard that it breaks.
+
+FOR EMOTION DATA GENERATION: The speaker reference IS the emotion reference
+in our pipeline (after VC converts it to the target speaker's voice). So this
+scale directly controls emotion prosody transfer. The range 8.0-10.0 is most
+interesting. Higher values push the model to replicate the emotional delivery
+of the reference more faithfully, which is exactly what we want. But going
+above 10 risks artifacts that would hurt quality scores.
+
+
+cfg_min_t / cfg_max_t (default: 0.5 / 1.0)
+--------------------------------------------
+These parameters control WHEN during the denoising process CFG is active.
+Understanding this requires knowing about the timestep schedule.
+
+THE TIMESTEP SCHEDULE: The denoising process goes from t=1.0 (pure noise)
+down to t=0.0 (clean signal) in 40 steps. At each step, the model sees
+the partially denoised signal and predicts how to clean it up further.
+
+The key insight is that different stages of denoising handle different
+aspects of the audio:
+
+  t = 1.0 → 0.7 (early, "noisy" phase):
+    The signal is still mostly noise. The model is making big structural
+    decisions: overall duration, rough pitch contour, where words start and
+    end, the basic rhythm and energy pattern. This is where the "shape" of
+    the utterance is determined. CFG is very important here because it guides
+    these high-level decisions.
+
+  t = 0.7 → 0.3 (middle phase):
+    The broad structure is locked in. The model is now filling in medium-level
+    details: exact pitch movements within words, consonant placement, vowel
+    quality, breathiness. CFG still helps guide these decisions but is less
+    critical than in the early phase.
+
+  t = 0.3 → 0.0 (late, "clean" phase):
+    The audio is nearly final. The model is just polishing micro-details:
+    the exact timbre of each phoneme, subtle noise characteristics, the fine
+    texture of the voice. CFG is least useful here and can actually hurt by
+    introducing slight artifacts (the amplified differences become noise at
+    these very fine scales).
+
+The default cfg_min_t=0.5, cfg_max_t=1.0 means: apply CFG only during steps
+where t >= 0.5 (the noisy half), and use pure conditional inference (no CFG)
+for t < 0.5 (the clean half). This is a performance optimization that cuts
+the number of 3x-expensive CFG steps in half, reducing total generation time
+by about 33% compared to applying CFG everywhere.
+
+Tuning options:
+
+  cfg_min_t=0.0, cfg_max_t=1.0:
+    Apply CFG for ALL 40 steps. Slower (~50% more wall time), but ensures
+    maximum guidance throughout the entire denoising process. Try this if
+    you feel the model is "losing" the emotion or speaker identity during
+    the late refinement phase.
+
+  cfg_min_t=0.3, cfg_max_t=1.0:
+    Apply CFG for 70% of steps. A compromise: slightly more guidance than
+    default, slightly slower, but ensures guidance through the medium-detail
+    phase too.
+
+  cfg_min_t=0.5, cfg_max_t=0.8:
+    Only apply CFG in the mid-noise range. Skips both the very noisy (where
+    the model is somewhat chaotic anyway) and the very clean (where CFG adds
+    noise). An experimental setting that might produce slightly more natural
+    results at the cost of less reliable speaker matching.
+
+  cfg_min_t=0.7, cfg_max_t=1.0:
+    Only apply CFG during the very first few noisy steps. Minimal guidance
+    overhead, fastest generation, but weak control over the output. Not
+    recommended for emotion work.
+
+FOR EMOTION DATA GENERATION: Consider cfg_min_t=0.3 to extend guidance into
+the medium-detail phase. Emotional prosody involves not just the broad pitch
+contour (decided in the noisy phase) but also specific pitch movements within
+words, emphasis patterns, and rhythmic variation (decided in the medium phase).
+The slowdown is modest (~15% more compute) but could improve emotion transfer.
+
+
+================================================================================
+PART 3: SPEAKER KV SCALING (Advanced)
+================================================================================
+
+While CFG controls speaker influence through the guidance formula (amplifying
+the difference between conditional and unconditional predictions), speaker KV
+scaling provides a more direct, surgical way to control how strongly the model
+attends to the speaker reference. These are two independent mechanisms, and
+they can be used together.
+
+
+HOW ATTENTION WORKS IN ECHO TTS (brief primer)
+-----------------------------------------------
+The DiT model has 24 transformer layers. Each layer has a "joint attention"
+mechanism that attends to three things simultaneously:
+
+  1. The noisy latent sequence (self-attention within the audio being generated)
+  2. Text tokens (cross-attention to understand what words to say)
+  3. Speaker latent tokens (cross-attention to match the speaker's voice)
+
+For text and speaker, the model pre-computes "key" and "value" vectors (the
+KV cache) before the sampling loop begins. During each denoising step, the
+model's "query" vectors (from the noisy latent) attend to these pre-computed
+keys and values. The attention score determines how much influence each
+speaker token has on each position in the generated audio.
+
+
+speaker_kv_scale (default: None = disabled)
+-------------------------------------------
+When enabled, this multiplies the speaker's key and value vectors by a scalar
+factor. This directly affects the attention scores: larger keys produce higher
+attention weights, which means the model "listens" more to the speaker
+reference.
+
+  None (default): No scaling. The attention works as the model was trained.
+
+  1.0: Explicitly enabled but no actual change. Same as None.
+
+  1.2: Mild boost. The model pays 20% more attention to the speaker tokens.
+       This subtly strengthens voice identity and prosody transfer without
+       being heavy-handed.
+
+  1.5: Strong boost. The model pays 50% more attention to the speaker.
+       Noticeably stronger voice matching than default. Can improve emotion
+       transfer because the model more closely follows the speaker reference's
+       prosody patterns (pitch, rhythm, energy).
+
+  0.5: Reduction. The model pays less attention to the speaker. The output
+       sounds more "generic" and less like the reference. Useful if the
+       reference audio has artifacts you want to minimize.
+
+  2.0+: Very strong. Risk of artifacts: the model might "copy" from the
+        reference too literally, producing echoes, pitch glitches, or
+        incoherent speech.
+
+How this differs from cfg_scale_speaker:
+  - cfg_scale_speaker works through the guidance formula (amplifying the
+    difference between with-speaker and without-speaker predictions). It's
+    a post-hoc correction applied to the velocity prediction.
+  - speaker_kv_scale works directly on the attention mechanism inside the
+    model. It changes how the model processes the speaker information
+    during its forward pass. It's more "fundamental."
+  - In practice, they're complementary. You can use moderate cfg_scale_speaker
+    (8.0) with a mild speaker_kv_scale (1.2) to get strong speaker matching
+    without the artifacts that extreme CFG values cause.
+
+
+speaker_kv_max_layers (default: None = all 24 layers)
+-----------------------------------------------------
+When speaker_kv_scale is active, this parameter limits which transformer
+layers get the scaling applied to them. Only the first N layers are affected.
+
+Why this matters: Different layers in a deep transformer handle different
+levels of abstraction. In Echo TTS's 24-layer architecture:
+
+  Layers 0-7 (early): Handle coarse, high-level features. This includes
+    voice identity (who is speaking), overall pitch range, energy level,
+    speaking rate, and the broad emotional contour. These layers establish
+    the "character" of the voice.
+
+  Layers 8-15 (middle): Handle medium-level features. Pitch movements
+    within individual words, emphasis patterns, prosodic phrasing, the
+    rhythm of stressed vs. unstressed syllables. This is where a lot of
+    the emotional expressiveness lives.
+
+  Layers 16-23 (late): Handle fine-grained features. The exact phonetic
+    quality of each sound, consonant articulation, vowel formants, the
+    precise placement of each speech sound in time. This is primarily
+    about intelligibility and "how clear the words sound."
+
+By limiting KV scaling to only early layers, you can boost the coarse
+speaker characteristics (voice identity, emotional energy) without
+interfering with the fine articulation in later layers:
+
+  speaker_kv_max_layers=8:
+    Only boost layers 0-7. Strengthens voice identity and overall emotional
+    energy, but leaves pronunciation and articulation completely unaffected.
+
+  speaker_kv_max_layers=12:
+    Boost layers 0-11. Strengthens voice identity, emotional energy, AND
+    some of the medium-level prosodic patterns (pitch movements, emphasis).
+    A good balance for emotion work.
+
+  speaker_kv_max_layers=16:
+    Boost layers 0-15. Almost full coverage -- only the finest articulation
+    layers are left alone. Strong speaker/emotion influence, slight risk
+    of affecting pronunciation.
+
+  None (all 24 layers):
+    Every layer gets the boost. Strongest possible effect, but also the
+    highest risk of degrading pronunciation or causing artifacts.
+
+
+speaker_kv_min_t (default: None = always active)
+-------------------------------------------------
+This controls WHEN during the denoising process the KV scaling is active,
+based on the timestep. When the timestep drops below this value, the
+scaling is removed (the speaker KV vectors return to their unscaled values).
+
+This creates a "fade out" effect: the model gets extra speaker influence
+during the noisy phase (where it makes big structural decisions) but returns
+to normal during the clean phase (where it polishes details).
+
+  None (default): KV scaling is active for all timesteps if enabled.
+
+  0.3: KV scaling active for t >= 0.3 (the first ~70% of denoising), then
+       removed for t < 0.3 (the last ~30%). This ensures the coarse emotional
+       structure is locked in with strong speaker influence, then the model
+       gets full freedom to clean up the fine details.
+
+  0.5: KV scaling only for the noisy half. More conservative -- the extra
+       speaker influence stops earlier.
+
+PRACTICAL RECIPE: For emotion transfer, try:
+  speaker_kv_scale=1.3, speaker_kv_max_layers=12, speaker_kv_min_t=0.3
+
+This says: "During the first 70% of denoising, boost speaker/emotion
+attention by 30% in the first 12 (of 24) layers. Then let the model finish
+cleaning up without any extra influence." This is a targeted intervention
+that strengthens emotion transfer in the phase and layers where it matters
+most, without degrading articulation quality.
+
+
+================================================================================
+PART 4: TEMPORAL RESCALING (Experimental)
+================================================================================
+
+rescale_k / rescale_sigma (default: None = disabled)
+-----------------------------------------------------
+These implement a technique from arXiv:2510.01184 ("temporal score rescaling")
+that addresses an observation about diffusion models: the magnitude of the
+model's velocity predictions can vary significantly across timesteps. Early
+in the denoising process (high t), the model might predict large velocities,
+while late (low t), it might predict tiny ones. This mismatch can cause
+subtle issues like overall pitch drift or volume inconsistencies.
+
+The rescaling applies a timestep-dependent correction factor to the velocity:
+
+  ratio = (snr * sigma^2 + 1) / (snr * sigma^2 / k + 1)
+  where snr = (1-t)^2 / t^2  (signal-to-noise ratio at timestep t)
+
+The parameters:
+  rescale_k: Controls the overall strength of the rescaling effect
+  rescale_sigma: Controls the width/shape of the rescaling curve
+
+This is genuinely experimental. In practice, Echo TTS works well without it
+for most inputs. You might want to try it if you notice:
+  - Consistent pitch offset (everything generated is slightly too high/low)
+  - Volume inconsistencies across generated samples
+  - Strange artifacts at the beginning or end of generated audio
+
+For our emotion pipeline, this is low priority. Start with the CFG and
+speaker KV parameters above, which have much larger effects.
+
+
+================================================================================
+PART 5: TWO GENERATION MODES
+================================================================================
+
+Echo TTS supports two fundamentally different ways to generate audio. Our
+pipeline uses Standard Generation, but Blockwise Generation is available
+for streaming use cases.
+
+
+A) STANDARD GENERATION (euler_sample)
+--------------------------------------
+This is the simpler and higher-quality mode. The model generates the entire
+latent sequence in one shot.
+
+  How it works:
+    1. Allocate the full sequence (e.g., 640 frames = ~30 seconds max)
+    2. Fill it with scaled random noise
+    3. Run 40 Euler steps, each step refining the entire sequence at once
+    4. Decode the final clean latent to audio
+    5. Crop trailing silence
+
+  Config: SamplerConfig(num_steps=40, cfg_scale_text=3.0, cfg_scale_speaker=8.0)
+
+  Advantages:
+    - Highest quality. Every frame is generated with full context of every
+      other frame. The model can plan the entire utterance holistically --
+      it knows how long the sentence is, where the emphasis should go, how
+      to pace the whole thing.
+    - Simplest to use. One function call, one output.
+    - Most reliable. Fewest failure modes.
+
+  Disadvantages:
+    - No streaming. You must wait for the entire generation to finish before
+      hearing anything. At ~4.4 seconds per generation, this is fine for
+      batch processing but not ideal for interactive applications.
+    - Memory scales with sequence length. A 640-frame sequence needs more
+      memory than a 64-frame one (though the model's internal memory is
+      the real bottleneck, not the latent itself).
+
+  This is what we use in the voice-acting pipeline. For batch data generation,
+  there's no benefit to streaming.
+
+
+B) BLOCKWISE GENERATION (blockwise_euler_sample)
+-------------------------------------------------
+This mode generates audio in chunks ("blocks"). Each block is a short segment
+(e.g., 128 frames = ~6 seconds) that can attend to all previously generated
+blocks via cached attention keys and values.
+
+  How it works:
+    1. Generate block 1 (e.g., 128 frames) from noise using Euler steps
+    2. Cache block 1's attention KV pairs
+    3. Generate block 2 (e.g., 128 frames) from noise, attending to block 1
+    4. Cache block 2's KV pairs
+    5. Generate block 3 (e.g., 64 frames) from noise, attending to blocks 1+2
+    6. Concatenate all blocks
+
+  Config: BlockwiseConfig(
+      block_sizes=[128, 128, 64],  # 3 blocks, ~15 seconds total
+      cfg_scale_speaker=5.0,       # lower default for better continuity
+      ...
+  )
+
+  Advantages:
+    - Streaming: You can start playing block 1 while generating block 2.
+    - Continuation: You can encode existing audio and use it as a prefix
+      (continuation_latent), then generate new audio that follows naturally.
+    - Memory efficient for very long sequences (only the current block is
+      being denoised; previous blocks are stored as compact KV caches).
+
+  Disadvantages:
+    - Slightly lower quality. Each block is generated somewhat independently
+      (it can attend to previous blocks, but it doesn't have "future" context).
+      This can cause slight discontinuities at block boundaries.
+    - More complex configuration. You need to choose block sizes, and the
+      balance of parameters is different (e.g., cfg_scale_speaker defaults to
+      5.0 instead of 8.0, because too-strong speaker guidance can cause
+      each block to sound like the beginning of a new utterance).
+
+  Block size guidelines:
+    [128, 128, 64] = ~15 seconds in 3 blocks (the default)
+    [256] = ~12 seconds in 1 block (essentially standard mode in blockwise infra)
+    [64, 64, 64, 64, 64] = ~15 seconds in 5 small blocks (max streaming)
+
+  For our pipeline: We don't need blockwise generation. Standard mode gives
+  better quality, and we're doing batch processing where latency doesn't matter.
+  However, blockwise mode could be interesting for a future real-time
+  application that generates emotional speech on the fly.
+
+
+================================================================================
+PART 6: THE FULL PIPELINE IN DETAIL
+================================================================================
+
+Let's trace the complete execution of a single TTS generation call, from
+text input to audio output. Understanding this helps you reason about where
+each parameter has its effect.
+
+
+STEP 1: TEXT ENCODING
+
+The input text is converted to a sequence of integer token IDs. Echo TTS uses
+a simple byte-level encoding: each character becomes its UTF-8 byte value
+(0-255), with a special BOS (beginning of sequence) token prepended as 0.
+
+  "[S1] Hello world" becomes [0, 91, 83, 49, 93, 32, 72, 101, 108, 108, 111, 32, 119, 111, 114, 108, 100]
+
+The text is also normalized: smart quotes become straight quotes, ellipses
+are standardized, excessive whitespace is collapsed. The maximum length is
+768 tokens, which is about 750 characters (more than enough for any
+reasonable sentence).
+
+The text tokens are then embedded and processed by a dedicated text encoder
+(14 transformer layers, 1280-dim, 10 attention heads). The output is a
+sequence of text embeddings that capture the meaning, pronunciation, and
+structure of the input text. These embeddings are pre-computed once and
+cached as key-value pairs for all 24 DiT layers.
+
+
+STEP 2: SPEAKER ENCODING
+
+The speaker reference audio goes through several transformations:
+
+  a) Waveform normalization: The audio is peak-normalized (divided by its
+     max absolute value, clamped to at least 1.0) so the input level is
+     consistent regardless of the recording's volume.
+
+  b) S1-DAC encoding: The normalized audio is fed through the S1-DAC encoder
+     and quantizer, producing 1024-dimensional latent vectors at ~21.5
+     frames per second (hop length 2048 at 44.1kHz).
+
+  c) PCA projection: The 1024-dim vectors are centered (subtract mean),
+     projected to 80 dimensions (multiply by the PCA components matrix),
+     and scaled by a learned scalar. Now we have ~21.5 frames/sec of
+     80-dimensional speaker latents.
+
+  d) Chunked encoding: For long speaker references, the encoding is done
+     in chunks of 640×2048 = 1,310,720 samples (~30 seconds) to manage
+     memory. The chunks are concatenated afterward.
+
+  e) Masking: A binary mask tracks which frames contain real audio vs.
+     padding. Only real frames participate in attention.
+
+  f) Patch trimming: The speaker latent length is trimmed to be divisible
+     by 4 (the speaker patch size).
+
+The resulting speaker latent and mask are then processed by a dedicated
+speaker encoder (14 transformer layers, 1280-dim, 10 attention heads, with
+4-frame patching). The output KV pairs are cached for all 24 DiT layers.
+
+Typical timing: ~0.3 seconds for a 10-second reference, done once per speaker.
+
+
+STEP 3: KV CACHE SETUP
+
+Before the sampling loop, the model pre-computes key-value caches:
+
+  text_kv = model.get_kv_cache_text(text_ids, text_mask)
+  speaker_kv = model.get_kv_cache_speaker(speaker_latent, speaker_mask)
+
+Each of these returns a list of 24 (key, value) tensor pairs, one per DiT
+layer. During the sampling loop, the model's self-attention queries will
+attend to these cached KVs without recomputing them.
+
+For CFG, the system creates 3 copies of the KV caches:
+  - cond: full text KV + full speaker KV
+  - uncond_text: empty text KV + full speaker KV
+  - uncond_speaker: full text KV + empty speaker KV
+
+If speaker_kv_scale is active, the speaker KVs are scaled at this point
+(multiplied by the scale factor for the appropriate layers).
+
+
+STEP 4: THE SAMPLING LOOP
+
+This is the heart of the generation process. 40 iterations of Euler's method
+trace the ODE from noise (t=1.0) to clean signal (t=0.0).
+
+The timestep schedule is linearly spaced: [1.0, 0.975, 0.95, ..., 0.025, 0.0]
+
+For each step i:
+
+  a) Get current timestep t = schedule[i] and next timestep t_next = schedule[i+1]
+
+  b) Determine if CFG is active (cfg_min_t <= t <= cfg_max_t)
+
+  c) If CFG is active:
+     - Stack the noisy latent 3 times into a batch: [x, x, x]
+     - Inject timestep embedding (t tells the model how noisy the input is)
+     - Run the model once with batch_size=3, using the 3 KV cache variants
+     - Split the output into v_cond, v_uncond_text, v_uncond_speaker
+     - Apply the CFG formula to get v_final
+
+  d) If CFG is NOT active (we're in the "clean" phase below cfg_min_t):
+     - Run the model once with the full-conditioning KV cache only
+     - v_final = v_cond (no guidance correction)
+
+  e) If temporal rescaling is active, apply the timestep-dependent correction
+
+  f) If speaker_kv_min_t is set and t just crossed below it, swap the speaker
+     KV cache from scaled to unscaled (the "fade out" transition)
+
+  g) Take the Euler step: x_new = x_old + v_final * (t_next - t)
+
+After 40 iterations, x has been transformed from random noise into a clean
+latent sequence of shape (1, sequence_length, 80).
+
+
+STEP 5: DECODING
+
+The clean latent is converted back to audio:
+
+  a) PCA inverse: The 80-dim latent is projected back to 1024 dimensions
+     using the inverse PCA transformation: z_1024 = (z_80 / scale) @ components + mean
+
+  b) S1-DAC decode: The 1024-dim latent is fed through the S1-DAC decoder
+     (which mirrors the encoder: upsampling convolutions with rates (8,8,4,2),
+     with 4 transformer layers at the first stage). This produces raw audio
+     at 44.1kHz.
+
+  c) Silence cropping: The system examines the latent signal energy to detect
+     where the speech ends. Any trailing silence is cropped off. This is
+     important because the model often generates fewer frames than the
+     maximum sequence length, and the tail is just noise/silence.
+
+The final output is a tensor of shape (1, 1, num_samples) at 44.1kHz.
+
+
+================================================================================
+PART 7: WHAT TO TUNE FOR EMOTION DATA GENERATION
+================================================================================
+
+In our voice-acting pipeline, we want the TTS model to generate speech that
+conveys a specific emotion. The emotional quality comes from the speaker
+reference (which is a voice-converted emotion reference). The challenge is
+that default TTS settings are optimized for clarity and naturalness, not for
+emotion transfer. Here's how to push the model toward more emotional output.
+
+Our current (default) settings:
+  num_steps=40, cfg_scale_text=3.0, cfg_scale_speaker=8.0
+
+
+EXPERIMENT A: LOWER TEXT CFG (more emotional freedom)
+  SamplerConfig(cfg_scale_text=2.0, cfg_scale_speaker=8.0)
+
+  Rationale: High text guidance forces the model to prioritize precise
+  pronunciation. This competes with emotional expression -- you can't sob
+  through your words AND pronounce them perfectly at the same time. Lowering
+  text guidance gives the model permission to sacrifice some clarity for more
+  authentic emotional delivery.
+
+  Expected effect: More natural, emotionally expressive speech. Possible
+  slight decrease in word accuracy (occasional mumbling or skipped syllables).
+
+  Risk: If text guidance is too low, the model may drift away from the
+  intended text entirely. 2.0 is a safe lower bound.
+
+
+EXPERIMENT B: HIGHER SPEAKER CFG (stronger emotion reference influence)
+  SamplerConfig(cfg_scale_text=3.0, cfg_scale_speaker=10.0)
+
+  Rationale: The speaker reference IS the emotion reference (after VC). Higher
+  speaker guidance pushes the model to more faithfully replicate the prosody,
+  pitch contour, energy, and rhythm of the emotion reference.
+
+  Expected effect: Generated speech more closely matches the emotional delivery
+  of the reference. Stronger emotion scores from Empathic Insight.
+
+  Risk: Values above 10 may introduce artifacts (metallic quality, pitch
+  glitches). Also, if the VC'd reference has any quality issues, they get
+  amplified.
+
+
+EXPERIMENT C: SPEAKER KV BOOST (targeted emotion amplification)
+  SamplerConfig(
+    cfg_scale_text=3.0, cfg_scale_speaker=8.0,
+    speaker_kv_scale=1.3, speaker_kv_max_layers=12
+  )
+
+  Rationale: Instead of cranking up cfg_scale_speaker (which amplifies
+  everything including noise), this selectively boosts the model's attention
+  to the speaker reference in the first 12 (of 24) layers. Early/middle
+  layers handle voice identity and emotional prosody; later layers handle
+  pronunciation. So this boosts emotion without degrading articulation.
+
+  Expected effect: Stronger emotion prosody transfer, maintained pronunciation
+  quality. A more surgical approach than just raising cfg_scale_speaker.
+
+  Risk: Minor. The effect is gentler than extreme CFG values. At 1.3x, you're
+  unlikely to see artifacts.
+
+
+EXPERIMENT D: WIDER CFG WINDOW (apply guidance throughout)
+  SamplerConfig(cfg_min_t=0.2, cfg_max_t=1.0)
+
+  Rationale: The default cfg_min_t=0.5 means guidance stops halfway through
+  the denoising process. But emotional prosody involves medium-level details
+  (pitch movements, emphasis) that are refined during the t=0.3-0.5 range.
+  Extending guidance ensures the model stays on-track for emotion through
+  these refinement steps.
+
+  Expected effect: Slightly better emotion preservation in the final output,
+  at the cost of ~20% more compute (more steps have 3x forward passes).
+
+  Risk: Applying CFG too late (close to t=0.0) can add subtle artifacts.
+  cfg_min_t=0.2 is a good compromise.
+
+
+EXPERIMENT E: FEWER STEPS + HIGHER TRUNCATION (faster with more diversity)
+  SamplerConfig(num_steps=20, truncation_factor=0.9)
+
+  Rationale: If we're already generating 10 seeds per reference and picking
+  the best one, we might get more value from generating MORE seeds at lower
+  quality than fewer seeds at higher quality. 20 steps is 2x faster, and
+  truncation_factor=0.9 increases the diversity between seeds.
+
+  Expected effect: Each individual generation is slightly lower quality, but
+  you can generate twice as many seeds in the same time. With 20 seeds instead
+  of 10, the "best of N" might have higher emotion scores than the "best of 10"
+  with 40 steps.
+
+  Risk: If 20 steps degrades quality too much, the best-of-20 might not
+  compensate. Needs empirical testing.
+
+
+EXPERIMENT F: COMBINED "EMOTION OPTIMIZED"
+  SamplerConfig(
+    num_steps=40,
+    cfg_scale_text=2.5,       # slightly lower: more prosodic freedom
+    cfg_scale_speaker=10.0,   # stronger: follow emotion reference more
+    cfg_min_t=0.3,            # wider: guide through detail phase too
+    cfg_max_t=1.0,
+    truncation_factor=0.85,   # slightly higher: more diversity for seed selection
+    speaker_kv_scale=1.2,     # mild KV boost: attention-level reinforcement
+    speaker_kv_max_layers=16, # boost in first 16/24 layers
+    speaker_kv_min_t=0.2,     # fade out: clean finish
+  )
+
+  Rationale: Combine the best ideas from all experiments. Lower text guidance
+  for freedom, higher speaker guidance for emotion fidelity, wider CFG window
+  for sustained control, KV boost for targeted reinforcement, and higher
+  truncation for better seed diversity.
+
+  Expected effect: The highest possible emotion transfer, at slightly higher
+  compute cost (~20% more than default from the wider CFG window).
+
+  Risk: Stacking multiple interventions could have unexpected interactions.
+  Test this on a small batch first and compare to default settings.
+
+
+TESTING STRATEGY: Run each experiment on the same-text demo setup (same text,
+same 5 emotion references, 10 seeds each). Compare the resulting Empathic
+Insight emotion scores. The current 10-seed best-of-N approach already provides
+meaningful improvement -- combining it with tuned sampling parameters should
+push emotion scores significantly higher.
+
+
+================================================================================
+PART 8: PERFORMANCE NUMBERS (measured on A100-SXM4-80GB)
+================================================================================
+
+These are real measurements from the benchmark script, not estimates.
+
+GENERATION TIME (per call, including speaker encoding + DAC decode):
+
+  40-step standard (default):
+    ~4.4 seconds per generation
+    Steps 1-20: CFG active (3x forward pass per step = 3x compute)
+    Steps 21-40: No CFG (1x forward pass per step)
+    Total: 20 steps × 3x + 20 steps × 1x = 80 effective forward passes
+
+  40-step with full CFG (cfg_min_t=0.0):
+    ~6.5 seconds per generation
+    All 40 steps: 3x forward pass = 120 effective forward passes
+    ~50% slower than default
+
+  40-step no-CFG (cfg_scale_text=0, cfg_scale_speaker=0):
+    ~1.8 seconds per generation
+    All 40 steps: 1x forward pass = 40 effective forward passes
+    ~60% faster but terrible quality (no guidance at all)
+
+  20-step standard:
+    ~2.2 seconds per generation
+    Half the steps = half the time (linear scaling)
+
+  8-step (requires consistency-distilled model):
+    ~1.0 seconds
+    Not available for the current model checkpoint
+
+OVERHEAD (done once per generation, included in the times above):
+  Speaker encoding (S1-DAC encode + PCA):  ~0.3 seconds
+  S1-DAC decoding (latent → audio):        ~0.1 seconds
+  Text encoding:                            negligible
+
+  Total overhead: ~0.5 seconds per generation
+  Per-step cost: ~0.11 seconds with CFG, ~0.045 seconds without CFG
+
+MODEL LOADING:
+  Cold load from HF cache → GPU:  ~13.5 seconds
+  Reload from CPU RAM → GPU:      ~1.3 seconds
+  Offload GPU → CPU RAM:          ~3.0 seconds
+
+VRAM USAGE:
+  DiT model (bf16, 24 layers):    ~5.5 GB
+  S1-DAC autoencoder (fp32):      ~1.5 GB
+  PCA state:                      ~0.3 GB
+  Inference peak (with CFG):      ~7.3 GB total
+  Note: CFG uses 3x batch size, which adds to activation memory
+
+
+================================================================================
+PART 9: GLOSSARY
+================================================================================
+
+Rectified Flow:
+  A type of generative model where the transformation from noise to data
+  follows a straight-line path. If you think of the "noisy signal" as a point
+  in high-dimensional space, and the "clean signal" as another point, Rectified
+  Flow learns to move from one to the other in a straight line. This is simpler
+  and more efficient than earlier diffusion approaches (like DDPM or score-based
+  models) that follow curved paths. The model learns to predict the "velocity"
+  (direction and speed) of this straight-line path.
+
+Velocity Prediction:
+  The model's output at each timestep. Given a noisy signal x_t that's a mix
+  of data and noise (specifically x_t = (1-t)*data + t*noise), the model
+  predicts v = data - noise (or equivalently, the direction from noise toward
+  data). This velocity, combined with the timestep schedule, tells the Euler
+  solver how to update the signal at each step.
+
+Euler Sampling / Euler Method:
+  The simplest numerical method for solving an ordinary differential equation
+  (ODE). At each step, you evaluate the velocity at the current point and take
+  a small step in that direction: x_new = x_old + velocity * dt. It's like
+  navigating by always walking straight toward where you want to go, checking
+  your direction periodically. More steps = more direction checks = more
+  accurate path. The "dt" is determined by the timestep schedule (the
+  difference between consecutive timesteps).
+
+CFG (Classifier-Free Guidance):
+  A technique to make conditional generation more controllable. During training,
+  the model is taught to work with AND without its conditioning signals (text,
+  speaker). At inference time, you compare the model's behavior with and
+  without the condition, and amplify the difference. The intuition: if adding
+  the text condition changes the model's prediction by a small amount, you
+  multiply that change by a scale factor (the CFG scale) to make the effect
+  stronger. This lets you independently control how strongly the model follows
+  each type of conditioning.
+
+KV Cache:
+  In transformer attention, inputs are projected into "queries" (Q), "keys"
+  (K), and "values" (V). The attention score is computed as Q·K^T, and the
+  output is the weighted sum of V. For text and speaker conditioning, the
+  K and V projections don't change between denoising steps (because the text
+  and speaker don't change). So we compute K and V once before the loop starts
+  and reuse them at every step. This saves roughly 2/3 of the attention
+  computation for cross-attention layers.
+
+S1-DAC (Fish-Speech S1 DAC):
+  The audio codec used inside Echo TTS. Based on the Fish-Speech S1 architecture,
+  it compresses raw 44.1kHz audio into compact latent representations. Key
+  features: (1) Convolutional encoder with rates (2,4,8,8) for temporal
+  downsampling. (2) Transformer-based quantizer (8 layers, windowed attention)
+  with additional 4x downsampling, giving an effective hop of 2048 samples.
+  (3) Large decoder (1536-dim, 4 transformer layers) for high-quality
+  reconstruction. (4) Residual Vector Quantization with 9 codebooks
+  (first codebook has 4096 entries, rest have 1024). Total latent dimensionality
+  is 1024 before PCA.
+
+  NOT to be confused with DACVAE (Facebook's DAC with VAE training at 48kHz),
+  which is used for dataset storage but NOT for Echo TTS inference.
+
+PCA (Principal Component Analysis):
+  A linear dimensionality reduction technique. In Echo TTS, it reduces the
+  1024-dimensional S1-DAC latent vectors to 80 dimensions for the diffusion
+  model. The transformation is:
+    encode: z_80 = (z_1024 - mean) @ components^T * scale
+    decode: z_1024 = (z_80 / scale) @ components + mean
+  where components is an (80, 1024) learned matrix. This is a lossless-ish
+  compression -- PCA keeps the 80 most important dimensions and discards the
+  rest (which contain mostly noise or redundant information). The scale factor
+  normalizes the latent values to a range that works well with the diffusion
+  model's noise schedule.
+
+DiT (Diffusion Transformer):
+  The core neural network architecture. It's a transformer (similar to GPT or
+  BERT in structure) but designed for diffusion/flow-matching tasks. It takes
+  three inputs: (1) the noisy latent sequence (what's being denoised), (2) text
+  embeddings (what to say), and (3) speaker embeddings (how to say it). The
+  model has 24 layers, each with self-attention on the latent sequence and
+  cross-attention to text and speaker KV caches. The output is a velocity
+  prediction (same shape as the input latent) that tells the Euler solver
+  which direction to step.
+
+  Echo TTS's DiT specifics: 2048-dim model, 16 attention heads, 5888-dim FFN,
+  with separate text/speaker encoders (14 layers each, 1280-dim, 10 heads).
+
+AdaLN (Adaptive Layer Normalization):
+  How the timestep information enters the model. Standard layer normalization
+  normalizes activations to zero mean and unit variance, then applies a learned
+  scale and shift. In AdaLN, the scale and shift are PREDICTED from the
+  timestep embedding (plus a low-rank adapter), not learned as fixed parameters.
+  This means each transformer layer's normalization behavior changes depending
+  on what timestep it is -- at t=0.9 (very noisy), the model processes things
+  differently than at t=0.1 (nearly clean). This is how the model knows
+  "how much noise is in my input right now?"
+
+RoPE (Rotary Position Embeddings):
+  A technique for encoding sequence position information into the attention
+  mechanism. Instead of adding position embeddings to the input (like the
+  original transformer), RoPE rotates the query and key vectors by an angle
+  proportional to their position. This has nice mathematical properties:
+  the attention score between two positions depends only on their relative
+  distance, not their absolute positions. In Echo TTS, RoPE is applied to
+  half the attention heads (the other half have no position encoding, which
+  helps with generalization to different sequence lengths).
+
+
+================================================================================
+End of guide.
+================================================================================
