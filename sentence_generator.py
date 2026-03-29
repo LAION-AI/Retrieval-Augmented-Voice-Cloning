@@ -150,7 +150,7 @@ def build_neutral_prompt(
     return system, user
 
 
-GEMINI_API_KEY = "AIzaSyAKfhr11N5S9kXnUpgFEDDFW_L4iwrxNdg"
+GEMINI_API_KEY = "AIzxxxx"
 
 # LLM backend: "vllm" or "gemini"
 LLM_BACKEND = "gemini"  # Default to gemini since VLLM may not be installed
