@@ -17,6 +17,7 @@ The resulting datasets can be used to train **omni-models** that accept natural-
 - [Speaker KV Scaling](#speaker-kv-scaling)
 - [Echo TTS Sampling Guide](#echo-tts-sampling-guide)
 - [Dataset Design for Omni-Model Training](#dataset-design-for-omni-model-training)
+- [Published Dataset](#published-dataset)
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Usage](#usage)
@@ -374,6 +375,114 @@ shard-00000.tar
 ├── sample_001.emotion_ref.dac.pth # DACVAE latent for emotion ref
 ├── sample_001.concat.dac.pth      # DACVAE latent for concatenation
 └── sample_001.metadata.json       # Scores, text, emotion labels, etc.
+```
+
+---
+
+## Published Dataset
+
+The first generation run produced **72,100 samples** across 43 emotion and attribute dimensions, available as a WebDataset on HuggingFace:
+
+**[TTS-AGI/voice-acting-pipeline-output](https://huggingface.co/datasets/TTS-AGI/voice-acting-pipeline-output)**
+
+### Summary
+
+| Metric | Value |
+|--------|-------|
+| Total samples | 72,100 |
+| Total tar shards | 1,691 |
+| Total size | 575.3 GB |
+| Completed buckets | 78 |
+| Compute time | ~658 GPU-hours |
+| Avg time per sample | 32.9 seconds |
+| Audio per sample | 3 emotional + 3 neutral + 1 reference = 7 WAVs |
+| Metadata per sample | 59-dimension EI scores + captions + generation params |
+
+### Per-Dimension Breakdown
+
+| Dimension | Samples | Buckets | Tars | Size (GB) |
+|-----------|---------|---------|------|-----------|
+| Affection | 1,600 | 0to1, 1to2, 2to3, 3to4, 4to5 | 77 | 31.2 |
+| Amusement | 1,050 | 0to1, 1to2, 2to3, 3to4, 4to5 | 46 | 17.3 |
+| Anger | 2,000 | 0to1, 1to2, 2to3, 3to4, 4to5, 5to6 | 46 | 5.1 |
+| Astonishment/Surprise | 1,050 | 0to1, 1to2, 2to3, 3to4, 4to5 | 45 | 17.2 |
+| Awe | 2,000 | 0to1, 1to2, 2to3, 3to4, 4to5 | 45 | 19.4 |
+| Bitterness | 1,950 | 0to1, 1to2, 2to3, 3to4, 4to5 | 45 | 16.4 |
+| Concentration | 2,000 | 0to1, 1to2, 2to3, 3to4, 4to5 | 45 | 18.5 |
+| Confusion | 2,000 | 0to1, 1to2, 2to3, 3to4, 4to5 | 45 | 17.1 |
+| Contemplation | 450 | 0to1, 1to2, 2to3, 3to4 | 44 | 18.4 |
+| Contempt | 1,950 | 0to1, 1to2, 2to3, 3to4, 4to5 | 45 | 9.8 |
+| Contentment | 2,000 | 0to1, 1to2, 2to3, 3to4 | 44 | 18.4 |
+| Disappointment | 1,950 | 0to1, 1to2, 2to3, 3to4, 4to5 | 43 | 17.6 |
+| Disgust | 1,950 | 0to1, 2to3, 3to4 | 41 | 5.3 |
+| Distress | 2,000 | 1to2, 3to4, 4to5 | 42 | 17.2 |
+| Doubt | 2,000 | 3to4, 4to5 | 40 | 16.3 |
+| Elation | 2,000 | 4to5, 5to6 | 40 | 16.5 |
+| Embarrassment | 2,000 | 0to1, 1to2, 2to3 | 42 | 15.4 |
+| Emotional Numbness | 1,950 | 1to2, 2to3, 3to4 | 40 | 5.5 |
+| Fatigue/Exhaustion | 2,000 | 3to4, 4to5 | 40 | 4.8 |
+| Fear | 2,000 | 2to3, 3to4 | 40 | 16.5 |
+| Helplessness | 1,850 | 2to3, 3to4 | 37 | 3.5 |
+| Hope/Enthusiasm | 2,000 | 5to6, 6to7 | 40 | 16.7 |
+| Impatience/Irritability | 2,000 | 3to4, 4to5 | 40 | 15.9 |
+| Infatuation | 2,000 | 3to4, 4to5 | 40 | 17.0 |
+| Interest | 2,000 | 2to3, 3to4 | 40 | 16.4 |
+| Intoxication | 2,000 | 3to4, 4to5 | 40 | 4.1 |
+| Longing | 2,000 | 2to3, 3to4 | 40 | 17.4 |
+| Malevolence/Malice | 2,000 | 2to3, 3to4 | 40 | 4.7 |
+| Pain | 1,950 | 4to5, 5to6 | 39 | 4.3 |
+| Pleasure/Ecstasy | 2,000 | 2to3, 3to4 | 40 | 17.3 |
+| Pride | 2,000 | 3to4, 4to5 | 40 | 16.9 |
+| Relief | 1,300 | 4to5, 5to6 | 40 | 17.1 |
+| Sadness | 2,000 | 3to4, 4to5 | 40 | 17.7 |
+| Sexual Lust | 2,000 | 3to4, 4to5 | 40 | 17.9 |
+| Shame | 2,000 | 4to5, 5to6 | 40 | 17.5 |
+| Sourness | 2,000 | 2to3, 3to4 | 40 | 5.4 |
+| Teasing | 2,000 | 2to3, 3to4 | 40 | 15.6 |
+| Thankfulness/Gratitude | 1,100 | 3to4, 4to5 | 62 | 26.4 |
+| Triumph | 2,000 | 3to4, 4to5 | 40 | 18.2 |
+| **Total** | **72,100** | | **1,691** | **575.3** |
+
+*Additional attribute dimensions (Age, Arousal, Authenticity, etc.) have exploratory 10-sample tars but were not run at scale.*
+
+### Tar Shard Format
+
+Each tar file is a WebDataset shard named `{dimension}_{bucket}_{random_id}.tar` containing ~10-50 samples:
+
+```
+Anger_4to5_1092434485.tar
+├── Anger_4to5_000.emotional_seed765532.wav    # Emotional TTS, seed 1
+├── Anger_4to5_000.emotional_seed588447.wav    # Emotional TTS, seed 2
+├── Anger_4to5_000.emotional_seed983636.wav    # Emotional TTS, seed 3
+├── Anger_4to5_000.neutral_seed765532.wav      # Neutral TTS, seed 1
+├── Anger_4to5_000.neutral_seed588447.wav      # Neutral TTS, seed 2
+├── Anger_4to5_000.neutral_seed983636.wav      # Neutral TTS, seed 3
+├── Anger_4to5_000.ref_audio.wav               # Speaker reference
+├── Anger_4to5_000.json                        # Metadata + 59-dim EI scores
+├── Anger_4to5_001.emotional_seed...wav
+└── ...
+```
+
+### Sample Metadata Schema
+
+```json
+{
+  "sample_id": "Anger_4to5_042",
+  "dimension": "Anger",
+  "bucket": [4, 5],
+  "voice_conversion": { "used_vc": true, "laion_voice": "speaker_name.wav" },
+  "emotional_sentence": { "text": "How dare they...", "topic": "injustice", "word_count_actual": 35 },
+  "neutral_sentence": { "text": "The report discusses...", "topic": "statistics", "word_count_actual": 28 },
+  "emotional_generations": [
+    {
+      "seed": 765532,
+      "duration": 8.2,
+      "ei_scores": { "Anger": 3.45, "Fear": 0.12, "Sadness": 0.34, "...": "..." },
+      "caption": "An angry male voice speaks forcefully about perceived injustice..."
+    }
+  ],
+  "neutral_generations": [ "..." ]
+}
 ```
 
 ---
